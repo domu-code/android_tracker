@@ -1,0 +1,177 @@
+name: PocketTracker 3 R15 - Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out R15 build files
+        uses: actions/checkout@v5
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configure Android SDK using runner command-line tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK_ROOT"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -x "$SDKMANAGER"
+          (yes || true) | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            'platforms;android-36' 'build-tools;36.0.0' \
+            'ndk;27.0.12077973' 'cmake;3.22.1'
+
+      - name: Verify R15 source and pin original Android launcher and artwork
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s PocketTracker3_R15_Source.zip
+          unzip -tq PocketTracker3_R15_Source.zip | tail -2
+          git clone --quiet https://github.com/conanizer/pockettracker.git upstream
+          git -C upstream checkout --quiet --detach 1aef69ec9db79a3e29808c08ab520c04c26c8265
+          test -s upstream/app/src/main/assets/themes/amiga-2/btn_square_normal.png
+          test -s upstream/app/src/main/assets/themes/amiga-2/btn_square_pressed.png
+          test -s upstream/app/src/main/assets/themes/amiga-2/btn_wide_normal.png
+          test -s upstream/app/src/main/java/com/conanizer/pockettracker/MainActivity.kt
+          test -s upstream/shell/licenses.txt
+          mkdir -p r15-source
+          unzip -q PocketTracker3_R15_Source.zip -d r15-source
+
+      - name: Overlay R15 engine and patch Android orientation method
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json, hashlib, re, shutil
+
+          src = Path('r15-source/PocketTracker3')
+          dst = Path('upstream')
+          assert (src/'VERSION').read_text().strip() == '0.19.0'
+          manifest = json.loads((src/'SOURCE_MANIFEST.json').read_text())
+          required = [
+              'native/CMakeLists.txt', 'shell/app.cpp', 'shell/android/android-main.cpp',
+              'shell/sdl/sdl-touch.cpp', 'shell/skin/portrait2.cpp',
+              'native/songcore/lgpt_commands.h', 'native/songcore/scheduler.cpp',
+              'native/engine-mix.cpp', 'native/ui/modules/settings_editor.cpp',
+              'native/ui/settings_store.cpp', 'R15_README.md',
+              'tests/r15_experimental.cpp'
+          ]
+          for rel in required:
+              path = src/rel
+              assert path.is_file(), f'Missing R15 component: {rel}'
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[rel], f'Bad source checksum: {rel}'
+          # Preserve original Android Kotlin/Gradle and all official Amiga button artwork.
+          # PortMaster source omits these files; it must never replace the upstream frontend.
+          shutil.copytree(src, dst, dirs_exist_ok=True)
+
+          gradle_file = dst/'app/build.gradle.kts'
+          gradle = gradle_file.read_text()
+          changes = [
+              (r'applicationId\s*=\s*"com\.conanizer\.pockettracker"',
+               'applicationId = "com.oll.pockettracker3.r14"'),
+              (r'versionCode\s*=\s*\d+', 'versionCode = 1500'),
+              (r'versionName\s*=\s*"[^"]+"', 'versionName = "0.19.0"'),
+              (r'abiFilters\s*\+=\s*listOf\("arm64-v8a",\s*"x86_64"\)',
+               'abiFilters += listOf("arm64-v8a")')
+          ]
+          for pattern, replacement in changes:
+              gradle, count = re.subn(pattern, replacement, gradle, count=1)
+              assert count == 1, f'Cannot patch Gradle: {pattern}'
+          gradle_file.write_text(gradle)
+
+          # R14 requested portrait automatically with the touchscreen. R15 adds an
+          # explicit three-state control without removing the original JVM entry point.
+          activity_file = dst/'app/src/main/java/com/conanizer/pockettracker/MainActivity.kt'
+          activity = activity_file.read_text()
+          anchor = '    @Keep\n    fun setLandscapeAllowed(allowed: Boolean) {'
+          assert activity.count(anchor) == 1, 'Original orientation API changed'
+          injection = '\n'.join([
+              '    @Keep',
+              '    fun setScreenOrientationMode(mode: Int) {',
+              '        runOnUiThread {',
+              '            val view = window.decorView',
+              '            view.removeCallbacks(portraitCheck)',
+              '            requestedOrientation = when (mode) {',
+              '                1 -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT',
+              '                2 -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE',
+              '                else -> ActivityInfo.SCREEN_ORIENTATION_FULL_USER',
+              '            }',
+              '            if (mode == 1) view.postDelayed(portraitCheck, ORIENTATION_SETTLE_MS)',
+              '        }',
+              '    }',
+              '',
+              ''
+          ])
+          activity = activity.replace(anchor, injection + anchor, 1)
+          assert 'fun setScreenOrientationMode(mode: Int)' in activity
+          activity_file.write_text(activity)
+
+          strings = dst/'app/src/main/res/values/strings.xml'
+          if strings.exists():
+              xml, count = re.subn(r'(<string\s+name="app_name"[^>]*>)[^<]*(</string>)',
+                                   r'\g<1>PocketTracker 3 R15\g<2>', strings.read_text(), count=1)
+              assert count == 1
+              strings.write_text(xml)
+          for rel in ('amiga-2/btn_square_normal.png','amiga-2/btn_square_pressed.png',
+                      'amiga-2/btn_wide_normal.png','amiga/btn_square_normal.png'):
+              assert (dst/'app/src/main/assets/themes'/rel).is_file(), rel
+          print('R15 engine, original Android artwork, live screen-orientation selector ready.')
+          PYCODE
+
+      - name: Compile and sign Android debug APK
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace --max-workers=2 :app:assembleDebug
+
+      - name: Verify native libraries, artwork and create APK release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          from zipfile import ZipFile
+          apk = next(Path('upstream/app/build/outputs/apk/debug').glob('*.apk'))
+          with ZipFile(apk) as z:
+              names = set(z.namelist())
+              for entry in ('lib/arm64-v8a/libSDL2.so',
+                            'lib/arm64-v8a/libpockettracker.so',
+                            'lib/arm64-v8a/libpockettracker-sdl.so',
+                            'AndroidManifest.xml'):
+                  assert entry in names, f'Missing APK component: {entry}'
+              assert any(n.startswith('assets/licenses/') for n in names)
+              for entry in ('assets/themes/amiga/btn_square_normal.png',
+                            'assets/themes/amiga-2/btn_square_normal.png',
+                            'assets/themes/amiga-2/btn_square_pressed.png'):
+                  assert entry in names, f'Missing original artwork: {entry}'
+          print('APK native libraries and original button graphics verified')
+          PYCODE
+          mkdir -p release
+          cp upstream/app/build/outputs/apk/debug/*.apk release/PocketTracker3-R15-Android-test.apk
+          sha256sum release/PocketTracker3-R15-Android-test.apk > release/SHA256SUMS.txt
+
+      - name: Upload R15 Android APK
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: PocketTracker3-R15-Android-APK
+          path: release/
+          if-no-files-found: warn
+          retention-days: 30

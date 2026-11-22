@@ -1,0 +1,71 @@
+name: PocketTracker 3 R15 - RG28XX PortMaster
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portmaster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out R15 source and R14 PortMaster installer
+        uses: actions/checkout@v5
+
+      - name: Verify archives and run R15 DSP smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s PocketTracker3_R15_Source.zip
+          test -s pockettracker3_r14.zip
+          echo '5963a6c80e762944f8f5838cd063a006c407a49d966fe68607a09a01262888c2  PocketTracker3_R15_Source.zip' | sha256sum -c -
+          echo '1339d3b77d894f7623a07719879e5a94861d4d68f291a0d423f86fd29864d12a  pockettracker3_r14.zip' | sha256sum -c -
+          unzip -tq PocketTracker3_R15_Source.zip | tail -2
+          unzip -tq pockettracker3_r14.zip | tail -2
+          unzip -q PocketTracker3_R15_Source.zip
+          test "$(cat PocketTracker3/VERSION)" = 0.19.0
+          g++ -std=c++17 -O0 -I PocketTracker3/native -I PocketTracker3/native/vendor/mutable \
+            PocketTracker3/tests/r15_experimental.cpp -o /tmp/r15-fx-smoke
+          /tmp/r15-fx-smoke
+
+      - name: Cross-compile ARM64 against Ubuntu 20.04 glibc
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          docker run --rm \
+            -v "$PWD:/work" -w /work/PocketTracker3 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            ubuntu:20.04 \
+            bash tools/build_r15_arm64.sh \
+              /work/pockettracker3_r14.zip \
+              /work/release/pockettracker3_r15.zip
+
+      - name: Verify release ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -tq release/pockettracker3_r15.zip | tail -2
+          python3 - <<'PYCODE'
+          from zipfile import ZipFile
+          with ZipFile('release/pockettracker3_r15.zip') as z:
+              names=set(z.namelist())
+              assert 'PocketTracker 3 R13.sh' in names
+              assert 'pockettracker3_r13/pockettracker.aarch64' in names
+              assert 'pockettracker3_r13/R15_README.md' in names
+              assert z.read('pockettracker3_r13/VERSION') == b'R15\n'
+              assert b'PocketTracker 3 R15' in z.read('pockettracker3_r13/RELEASE_ID.txt')
+          print('PortMaster R15 layout verified.')
+          PYCODE
+          sha256sum release/pockettracker3_r15.zip > release/SHA256SUMS.txt
+
+      - name: Upload R15 PortMaster installer
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: PocketTracker3-R15-PortMaster
+          path: release/
+          if-no-files-found: warn
+          retention-days: 30
